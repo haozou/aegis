@@ -1,0 +1,79 @@
+services:
+  # ── Aegis API Server ──────────────────────────────
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${HOME}/.azure:/root/.azure   # Mount Azure CLI credentials for MCP auth (read-write for token refresh)
+      - data:/app/data           # Persist uploads, sandbox, logs across deploys
+    environment:
+      - DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
+      - JWT_SECRET=${JWT_SECRET:-aegis-docker-secret-change-me-32ch}
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL:-http://host.docker.internal:5000}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # OAuth
+      - OAUTH_REDIRECT_BASE=${OAUTH_REDIRECT_BASE:-http://localhost:8000}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - MICROSOFT_CLIENT_ID=${MICROSOFT_CLIENT_ID:-}
+      - MICROSOFT_CLIENT_SECRET=${MICROSOFT_CLIENT_SECRET:-}
+      - MICROSOFT_TENANT=${MICROSOFT_TENANT:-common}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL ────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aegis
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Frontend ──────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Cloudflare Named Tunnel ──
+  # Tunnel: app.creativeaegis.com + creativeaegis.com -> web:3000
+  # Uses credentials + config mounted from ~/.cloudflared/
+  # Start with: make docker-tunnel
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run aegis
+    volumes:
+      - ./.cloudflared:/etc/cloudflared:ro
+    depends_on:
+      - web
+    restart: unless-stopped
+    profiles:
+      - tunnel
+
+volumes:
+  pgdata:
+  data:
