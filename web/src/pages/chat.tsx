@@ -10,6 +10,7 @@ import { listConversations, listMessages, deleteConversation } from '@/api/conve
 import { getAccessToken } from '@/api/client'
 import { uploadFile } from '@/api/files'
 import { ToolCallBlock } from '@/components/agent/tool-call-block'
+import { ArtifactsPanel, type Artifact } from '@/components/artifacts-panel'
 import type { Agent, Conversation, Message, StreamEvent, WsMessage, ToolCall } from '@/types'
 
 const SELECTED_AGENT_KEY = 'aegis_selected_agent'
@@ -69,6 +70,8 @@ export function ChatPage() {
   // Tool calls
   const [streamToolCalls, setStreamToolCalls] = useState<ToolCall[]>([])
   const [toolPanelOpen, setToolPanelOpen] = useState(() => window.innerWidth >= 768)
+  const [rightTab, setRightTab] = useState<'tools' | 'artifacts'>('tools')
+  const [activeArtifact, setActiveArtifact] = useState<Artifact | null>(null)
 
   // Attachments
   const [attachments, setAttachments] = useState<AttachmentPreview[]>([])
@@ -643,6 +646,52 @@ export function ChatPage() {
     }
   }, [])
 
+  // Extract artifacts (large code blocks + /api/files/ links) from assistant text
+  function extractArtifacts(text: string, msgId: string): Artifact[] {
+    const arts: Artifact[] = []
+    // Fenced code blocks
+    const codeRe = /```(\w+)?\n([\s\S]*?)```/g
+    let m: RegExpExecArray | null
+    let idx = 0
+    while ((m = codeRe.exec(text))) {
+      const lang = m[1] || 'text'
+      const content = m[2]
+      const lines = content.split('\n').length
+      if (lines >= 20) {
+        const isHtml = lang === 'html' || /^<!DOCTYPE|^<html/i.test(content.trim())
+        arts.push({
+          id: `${msgId}-code-${idx}`,
+          type: isHtml ? 'html' : 'code',
+          title: isHtml ? 'HTML document' : `${lang} (${lines} lines)`,
+          language: lang,
+          content,
+        })
+        idx++
+      }
+    }
+    // /api/files/ download links  — e.g. [resume.pdf](/api/files/abc)
+    const linkRe = /\[([^\]]+)\]\((\/api\/files\/[^\s)]+)\)/g
+    while ((m = linkRe.exec(text))) {
+      const filename = m[1]
+      const url = m[2].replace(/\?.*$/, '')
+      arts.push({
+        id: `${msgId}-file-${idx}`,
+        type: 'file',
+        title: filename,
+        filename,
+        url,
+      })
+      idx++
+    }
+    return arts
+  }
+
+  function openArtifact(a: Artifact) {
+    setActiveArtifact(a)
+    setRightTab('artifacts')
+    setToolPanelOpen(true)
+  }
+
   return (
     <div className="flex h-svh bg-background">
       {/* Mobile overlay */}
@@ -1202,6 +1251,30 @@ export function ChatPage() {
                       <div className="text-[14px] leading-[1.6] text-foreground agent-message">
                         <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{text}</ReactMarkdown>
                       </div>
+                      {/* Artifact chips */}
+                      {(() => {
+                        const arts = extractArtifacts(text, msg.id)
+                        if (arts.length === 0) return null
+                        return (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {arts.map(a => (
+                              <button
+                                key={a.id}
+                                onClick={() => openArtifact(a)}
+                                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                                title="Open in panel"
+                              >
+                                <svg width="11" height="11" viewBox="0 0 16 16" fill="none">
+                                  <rect x="2" y="1.5" width="9" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+                                  <path d="M11 4l3 3v7.5a.5.5 0 01-.5.5H5" stroke="currentColor" strokeWidth="1.3"/>
+                                </svg>
+                                <span className="truncate max-w-[200px]">{a.title}</span>
+                                <span className="opacity-60">↗</span>
+                              </button>
+                            ))}
+                          </div>
+                        )
+                      })()}
                       {/* Action toolbar — visible on hover */}
                       <div className="mt-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                         {/* Copy */}
@@ -1527,37 +1600,71 @@ export function ChatPage() {
           <div className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setToolPanelOpen(false)} />
         )}
 
-        {/* Right Tool Panel */}
+        {/* Right Panel (Tools | Artifacts tabs) */}
         {toolPanelOpen && (
-          <aside className="fixed inset-y-0 right-0 z-40 flex w-72 flex-col border-l border-border bg-sidebar transition-transform duration-200 md:relative md:z-auto md:translate-x-0">
-            <div className="flex items-center justify-between border-b border-border px-4 py-3">
-              <div className="flex items-center gap-2">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="text-primary/60">
-                  <path d="M8 1v4M8 11v4M1 8h4M11 8h4M3.5 3.5l2.5 2.5M10 10l2.5 2.5M3.5 12.5L6 10M10 6l2.5-2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                </svg>
-                <span className="text-sm font-medium text-foreground">Tool Activity</span>
-                {allToolCalls.length > 0 && (
-                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{allToolCalls.length}</span>
-                )}
-              </div>
-              <button onClick={() => setToolPanelOpen(false)} className="rounded p-1 text-muted-foreground hover:text-foreground">
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-1">
-              {allToolCalls.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-12 text-center">
-                  <svg width="24" height="24" viewBox="0 0 16 16" fill="none" className="text-muted-foreground/30 mb-2">
+          <aside className="fixed inset-y-0 right-0 z-40 flex w-80 flex-col border-l border-border bg-sidebar transition-transform duration-200 md:relative md:z-auto md:w-72 md:translate-x-0">
+            {/* Tabs */}
+            <div className="flex items-center justify-between border-b border-border px-2 py-2">
+              <div className="flex items-center gap-0.5">
+                <button
+                  onClick={() => setRightTab('tools')}
+                  className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors ${rightTab === 'tools' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
                     <path d="M8 1v4M8 11v4M1 8h4M11 8h4M3.5 3.5l2.5 2.5M10 10l2.5 2.5M3.5 12.5L6 10M10 6l2.5-2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
                   </svg>
-                  <p className="text-xs text-muted-foreground">No tool calls yet</p>
-                </div>
-              )}
-              {allToolCalls.map((tc) => (
-                <ToolCallBlock key={tc.id} tool={tc} />
-              ))}
-              <div ref={toolPanelBottomRef} />
+                  Tools
+                  {allToolCalls.length > 0 && (
+                    <span className="rounded-full bg-muted-foreground/15 px-1.5 text-[9px]">{allToolCalls.length}</span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setRightTab('artifacts')}
+                  className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors ${rightTab === 'artifacts' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                    <rect x="2" y="1.5" width="9" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+                    <path d="M11 4l3 3v7.5a.5.5 0 01-.5.5H5" stroke="currentColor" strokeWidth="1.3"/>
+                  </svg>
+                  Artifact
+                </button>
+              </div>
+              <button onClick={() => setToolPanelOpen(false)} className="rounded p-1 text-muted-foreground hover:text-foreground">
+                <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+              </button>
             </div>
+
+            {rightTab === 'tools' ? (
+              <div className="flex-1 overflow-y-auto p-3 space-y-1">
+                {allToolCalls.length === 0 && (
+                  <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <svg width="24" height="24" viewBox="0 0 16 16" fill="none" className="text-muted-foreground/30 mb-2">
+                      <path d="M8 1v4M8 11v4M1 8h4M11 8h4M3.5 3.5l2.5 2.5M10 10l2.5 2.5M3.5 12.5L6 10M10 6l2.5-2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                    </svg>
+                    <p className="text-xs text-muted-foreground">No tool calls yet</p>
+                  </div>
+                )}
+                {allToolCalls.map((tc) => (
+                  <ToolCallBlock key={tc.id} tool={tc} />
+                ))}
+                <div ref={toolPanelBottomRef} />
+              </div>
+            ) : (
+              <div className="flex-1 overflow-hidden">
+                {activeArtifact ? (
+                  <ArtifactsPanel artifact={activeArtifact} onClose={() => setActiveArtifact(null)} />
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full py-12 text-center px-4">
+                    <svg width="28" height="28" viewBox="0 0 16 16" fill="none" className="text-muted-foreground/30 mb-2">
+                      <rect x="2" y="1.5" width="9" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+                      <path d="M11 4l3 3v7.5a.5.5 0 01-.5.5H5" stroke="currentColor" strokeWidth="1.3"/>
+                    </svg>
+                    <p className="text-xs text-muted-foreground">No artifact open</p>
+                    <p className="text-[10px] text-muted-foreground/60 mt-1">Large code blocks &amp; files appear here</p>
+                  </div>
+                )}
+              </div>
+            )}
           </aside>
         )}
       </div>
