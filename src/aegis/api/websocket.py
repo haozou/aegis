@@ -183,6 +183,7 @@ async def agent_chat_ws(websocket: WebSocket, agent_id: str) -> None:
             elif msg_type == "message":
                 content = raw.get("content", "").strip()
                 attachments: list[dict[str, str]] = raw.get("attachments", [])
+                quote = raw.get("quote") or None
                 is_resend = bool(raw.get("resend", False))
                 if not content and not attachments:
                     continue
@@ -221,13 +222,14 @@ async def agent_chat_ws(websocket: WebSocket, agent_id: str) -> None:
                 async def _run(cid: str, msg: str, cfg: AgentConfig,
                                orch: AgentOrchestrator, sid: str,
                                ws: WebSocket, aid: str,
-                               atts: list[dict[str, str]]) -> None:
+                               atts: list[dict[str, str]],
+                               qt: dict[str, str] | None) -> None:
                     nonlocal stream_task_running
                     try:
                         full_resp = ""
                         async for event in orch.send_message(
                             session_id=sid, conversation_id=cid,
-                            content=msg, config=cfg, attachments=atts,
+                            content=msg, config=cfg, attachments=atts, quote=qt,
                         ):
                             ed = event.to_ws_dict()
                             if cid in _stream_buffers:
@@ -268,7 +270,7 @@ async def agent_chat_ws(websocket: WebSocket, agent_id: str) -> None:
                 task = asyncio.create_task(_run(
                     conversation_id, content, run_config,
                     session_orchestrator, session.id,
-                    websocket, agent_id, attachments,
+                    websocket, agent_id, attachments, quote,
                 ))
                 _stream_tasks[conversation_id] = task
 

@@ -13,6 +13,7 @@ from ..llm.types import LLMMessage, LLMRequest, StreamDelta
 from ..storage.repositories.messages import ContentPart, MessageCreate, ToolCall
 from ..utils.ids import new_tool_call_id
 from ..utils.logging import get_logger
+from ..utils.text_extract import extract_text
 from .types import AgentConfig, StreamEvent, StreamEventType
 
 logger = get_logger(__name__)
@@ -42,6 +43,7 @@ class ToolLoop:
         user_message: str,
         config: AgentConfig,
         attachments: list[dict[str, str]] | None = None,
+        quote: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run the full tool loop, yielding stream events."""
         from ..llm.registry import get_provider
@@ -124,6 +126,11 @@ class ToolLoop:
         msg_metadata: dict[str, Any] = {}
         if attachment_list:
             msg_metadata["attachments"] = attachment_list
+        if quote and quote.get("text"):
+            msg_metadata["quote"] = {
+                "author": quote.get("author", ""),
+                "text": quote.get("text", ""),
+            }
         if config.skip_user_message_save:
             logger.info("Resend: deleting old responses", conversation_id=conversation_id)
             await self.repos.messages.delete_after_last_user_message(conversation_id)
@@ -159,11 +166,22 @@ class ToolLoop:
         # 7. Build LLM message list
         llm_messages = self._history_to_llm(history_msgs)
 
+        # Compose effective user message for the LLM (prepend quote context)
+        effective_user_message = user_message
+        if quote and quote.get("text"):
+            quoted_lines = "\n".join(f"> {line}" for line in quote["text"].split("\n"))
+            effective_user_message = (
+                f"> **{quote.get('author', 'Earlier message')} said:**\n"
+                f"{quoted_lines}\n\n{user_message}"
+            )
+
         # Build user content — plain string if no attachments, list if multimodal
         if attachment_list:
             content_parts: list[Any] = []
-            if user_message:
-                content_parts.append({"type": "text", "text": user_message})
+            kb_notes: list[str] = []
+            INLINE_CHAR_LIMIT = 80000  # ~20k tokens — fits comfortably in modern context windows
+            if effective_user_message:
+                content_parts.append({"type": "text", "text": effective_user_message})
             for att in attachment_list:
                 file_id = att.get("file_id", "")
                 filename = att.get("filename", "upload")
@@ -174,27 +192,58 @@ class ToolLoop:
                     logger.warning("Attachment file not found", file_id=file_id, user_id=config.user_id)
                     continue
                 raw_bytes = matches[0].read_bytes()
-                b64 = base64.standard_b64encode(raw_bytes).decode()
                 if media_type.startswith("image/"):
+                    b64 = base64.standard_b64encode(raw_bytes).decode()
                     content_parts.append({
                         "type": "image",
                         "source": {"type": "base64", "media_type": media_type, "data": b64},
                     })
-                elif media_type == "application/pdf":
-                    content_parts.append({
-                        "type": "document",
-                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-                    })
-                else:
-                    # Plaintext fallback — decode and inline as text
-                    text_content = raw_bytes.decode("utf-8", errors="replace")
+                    continue
+
+                # Document — extract text, then either inline or push to KB
+                text, ok = extract_text(raw_bytes, media_type, filename)
+                if not ok or not text.strip():
                     content_parts.append({
                         "type": "text",
-                        "text": f"\n[Attached file: {filename}]\n{text_content}",
+                        "text": f"\n[Attached file: {filename} — could not extract text]",
                     })
-            llm_user_content: Any = content_parts if content_parts else user_message
+                    continue
+
+                if len(text) <= INLINE_CHAR_LIMIT:
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"\n--- Attached file: {filename} ---\n{text}\n--- End of {filename} ---",
+                    })
+                else:
+                    # Big doc → ingest into knowledge base, agent queries via knowledge_base tool
+                    kb_doc_id = await self._ingest_attachment_to_kb(
+                        config.agent_id, config.user_id, filename, text,
+                    )
+                    if kb_doc_id:
+                        kb_notes.append(
+                            f"`{filename}` ({len(text):,} chars) is large and has been added "
+                            f"to the knowledge base (document_id={kb_doc_id}). "
+                            f"Use the `knowledge_base` tool with action='search' to query it."
+                        )
+                    else:
+                        # KB unavailable — fall back to truncated inline
+                        truncated = text[:INLINE_CHAR_LIMIT]
+                        content_parts.append({
+                            "type": "text",
+                            "text": (
+                                f"\n--- Attached file: {filename} (TRUNCATED to first "
+                                f"{INLINE_CHAR_LIMIT:,} chars of {len(text):,}) ---\n{truncated}\n"
+                                f"--- End of {filename} ---"
+                            ),
+                        })
+            if kb_notes:
+                content_parts.append({
+                    "type": "text",
+                    "text": "[Note] " + " ".join(kb_notes),
+                })
+            llm_user_content: Any = content_parts if content_parts else effective_user_message
         else:
-            llm_user_content = user_message
+            llm_user_content = effective_user_message
 
         llm_messages.append(LLMMessage(role="user", content=llm_user_content))
 
@@ -452,3 +501,46 @@ class ToolLoop:
                     content=msg.get_text_content(),
                 ))
         return result
+
+    async def _ingest_attachment_to_kb(
+        self, agent_id: str, user_id: str, filename: str, text: str,
+    ) -> str | None:
+        """Ingest large attachment text into the agent's KB. Returns doc_id or None."""
+        if not self.memory or not getattr(self.memory, "available", False):
+            return None
+        try:
+            from ..knowledge.service import KnowledgeService
+            from ..storage.repositories.knowledge import KnowledgeDocCreate
+
+            kb_service = KnowledgeService(self.memory)
+            doc = await self.repos.knowledge.create(KnowledgeDocCreate(
+                agent_id=agent_id, user_id=user_id,
+                name=filename, source_type="file",
+                content_hash=kb_service.content_hash(text),
+            ))
+            chunk_count = await kb_service.add_text(
+                agent_id, doc.id, text, source_name=filename,
+            )
+            # Best-effort updates — chunks are already in ChromaDB and searchable
+            # even if these DB updates fail.
+            try:
+                await self.repos.knowledge.update_content(doc.id, text)
+            except Exception as e:
+                logger.warning("KB update_content failed (chunks still searchable)",
+                               doc_id=doc.id, error=str(e))
+            try:
+                await self.repos.knowledge.update_status(doc.id, "ready", chunk_count=chunk_count)
+            except Exception:
+                pass
+            logger.info(
+                "Attachment ingested to KB",
+                agent_id=agent_id, filename=filename,
+                doc_id=doc.id, chunks=chunk_count,
+            )
+            return doc.id
+        except Exception as e:
+            logger.warning(
+                "Failed to ingest attachment to KB",
+                filename=filename, error=str(e),
+            )
+            return None

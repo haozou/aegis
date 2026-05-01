@@ -30,6 +30,7 @@ class UpdateScheduleRequest(BaseModel):
     cron_expr: str | None = None
     prompt: str | None = None
     is_active: bool | None = None
+    timezone: str | None = None
 
 
 @router.get("/agents/{agent_id}/schedules")
@@ -112,6 +113,7 @@ async def update_schedule(
         cron_expr=data.cron_expr,
         prompt=data.prompt,
         is_active=data.is_active,
+        timezone=data.timezone,
     )
 
     return {"schedule": updated.model_dump()}

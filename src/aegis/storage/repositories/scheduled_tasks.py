@@ -50,12 +50,24 @@ class TaskRun(BaseModel):
     completed_at: str | None = None
 
 
-def compute_next_run(cron_expr: str, tz: str = "UTC") -> str:
-    """Compute the next run time from a cron expression."""
-    now = datetime.now(timezone.utc)
-    cron = croniter(cron_expr, now)
-    next_dt = cron.get_next(datetime)
-    return next_dt.isoformat()
+def compute_next_run(cron_expr: str, tz: str = "UTC", base: datetime | None = None) -> str:
+    """Compute the next run time from a cron expression in the task's local timezone.
+
+    Always returns an ISO-8601 UTC timestamp.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz) if tz else ZoneInfo("UTC")
+    except Exception:
+        zone = timezone.utc
+
+    base_utc = base or datetime.now(timezone.utc)
+    base_local = base_utc.astimezone(zone)
+    cron = croniter(cron_expr, base_local)
+    next_local = cron.get_next(datetime)
+    # croniter returns naive when given naive — but base_local is aware, so it returns aware
+    next_utc = next_local.astimezone(timezone.utc)
+    return next_utc.isoformat()
 
 
 class ScheduledTaskRepository:
@@ -93,24 +105,43 @@ class ScheduledTaskRepository:
         return [self._row_to_model(r) for r in rows]
 
     async def get_due(self) -> list[ScheduledTask]:
-        """Get all active tasks whose next_run is in the past (i.e., due now)."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Atomically claim all active tasks whose next_run is in the past.
+
+        Advances next_run to the upcoming slot immediately so that:
+          - long-running tasks aren't re-fired by the next tick (60s cadence)
+          - the same task can't be claimed twice
+        """
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat()
         rows = await self.db.fetchall(
             "SELECT * FROM scheduled_tasks WHERE is_active = TRUE AND next_run <= $1",
-            (now,),
+            (now_iso,),
         )
-        return [self._row_to_model(r) for r in rows]
+        if not rows:
+            return []
+        tasks = [self._row_to_model(r) for r in rows]
+        # Advance next_run NOW so a slow-running task isn't reclaimed next tick.
+        for t in tasks:
+            try:
+                next_run = compute_next_run(t.cron_expr, t.timezone, base=now_dt)
+            except Exception:
+                next_run = compute_next_run(t.cron_expr, t.timezone)
+            await self.db.execute(
+                "UPDATE scheduled_tasks SET next_run = $1 WHERE id = $2",
+                (next_run, t.id),
+            )
+        await self.db.commit()
+        return tasks
 
     async def mark_run(self, task_id: str) -> None:
-        """Update last_run and compute next_run."""
-        task = await self.get(task_id)
-        if not task:
-            return
+        """Update last_run after a task completes.
+
+        next_run was already advanced atomically in get_due() to prevent re-fire.
+        """
         now = datetime.now(timezone.utc).isoformat()
-        next_run = compute_next_run(task.cron_expr, task.timezone)
         await self.db.execute(
-            "UPDATE scheduled_tasks SET last_run = $1, next_run = $2 WHERE id = $3",
-            (now, next_run, task_id),
+            "UPDATE scheduled_tasks SET last_run = $1 WHERE id = $2",
+            (now, task_id),
         )
         await self.db.commit()
 
@@ -136,8 +167,9 @@ class ScheduledTaskRepository:
         cron_expr: str | None = None,
         prompt: str | None = None,
         is_active: bool | None = None,
+        timezone: str | None = None,
     ) -> ScheduledTask | None:
-        """Update schedule fields. Recomputes next_run if cron_expr changes."""
+        """Update schedule fields. Recomputes next_run if cron_expr or timezone changes."""
         task = await self.get(task_id)
         if not task:
             return None
@@ -150,12 +182,23 @@ class ScheduledTaskRepository:
             sets.append(f"name = ${idx}")
             params.append(name)
             idx += 1
+        # Apply timezone first so cron_expr recomputation uses it
+        effective_tz = timezone if timezone is not None else task.timezone
+        if timezone is not None:
+            sets.append(f"timezone = ${idx}")
+            params.append(timezone)
+            idx += 1
         if cron_expr is not None:
             sets.append(f"cron_expr = ${idx}")
             params.append(cron_expr)
             idx += 1
-            # Recompute next_run
-            next_run = compute_next_run(cron_expr, task.timezone)
+            next_run = compute_next_run(cron_expr, effective_tz)
+            sets.append(f"next_run = ${idx}")
+            params.append(next_run)
+            idx += 1
+        elif timezone is not None:
+            # Timezone changed but cron_expr didn't — still need to recompute next_run
+            next_run = compute_next_run(task.cron_expr, effective_tz)
             sets.append(f"next_run = ${idx}")
             params.append(next_run)
             idx += 1

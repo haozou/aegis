@@ -61,6 +61,7 @@ export function ChatPage() {
   // Messages & chat
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
+  const [quotedRef, setQuotedRef] = useState<{ author: string; text: string } | null>(null)
   const [streaming, setStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
   const [connected, setConnected] = useState(false)
@@ -431,13 +432,20 @@ export function ChatPage() {
     const text = input.trim()
     const readyAttachments = attachments.filter(a => !a.uploading && a.file_id)
     if ((!text && readyAttachments.length === 0) || !wsRef.current || streaming) return
+    // Send quote as a separate field — server stores it in metadata.quote and prepends
+    // for the LLM. The chat bubble shows ONLY `text`, with the quote rendered as a pill above.
+    const meta: Record<string, any> = {}
+    if (readyAttachments.length > 0) {
+      meta.attachments = readyAttachments.map(a => ({ file_id: a.file_id!, filename: a.filename, media_type: a.media_type }))
+    }
+    if (quotedRef) {
+      meta.quote = { author: quotedRef.author, text: quotedRef.text }
+    }
     setMessages((prev) => [...prev, {
       id: `temp_${Date.now()}`, conversation_id: conversationId || '',
       role: 'user', content: text, tool_calls: null, tool_call_id: null,
       created_at: new Date().toISOString(), tokens_used: 0,
-      metadata: readyAttachments.length > 0
-        ? { attachments: readyAttachments.map(a => ({ file_id: a.file_id!, filename: a.filename, media_type: a.media_type })) }
-        : {},
+      metadata: meta,
     }])
     setInput(''); setStreaming(true); streamingTextRef.current = ''
     setStreamingText(''); setError('')
@@ -450,9 +458,11 @@ export function ChatPage() {
       content: text,
       conversation_id: conversationId,
       attachments: readyAttachments.map(({ file_id, filename, media_type }) => ({ file_id, filename, media_type })),
+      quote: quotedRef ? { author: quotedRef.author, text: quotedRef.text } : null,
     }))
+    setQuotedRef(null)
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
-  }, [input, attachments, conversationId, streaming])
+  }, [input, attachments, conversationId, streaming, quotedRef])
 
   function getTextContent(msg: Message): string {
     if (typeof msg.content === 'string') return msg.content
@@ -548,6 +558,17 @@ export function ChatPage() {
     })
   }
 
+  function quoteMessage(text: string, author: string) {
+    setQuotedRef({ author, text })
+    setTimeout(() => {
+      const el = textareaRef.current
+      if (el) {
+        el.focus()
+        el.scrollIntoView({ block: 'end', behavior: 'smooth' })
+      }
+    }, 50)
+  }
+
   function thumbMessage(id: string, dir: 'up' | 'down') {
     setThumbedMsgId(prev => prev[id] === dir ? { ...prev, [id]: undefined as unknown as 'up' | 'down' } : { ...prev, [id]: dir })
   }
@@ -637,11 +658,28 @@ export function ChatPage() {
       return url
     }
     return {
-      a: ({ href, children, ...props }: any) => (
-        <a href={addToken(href || '')} target={href?.startsWith('/api/files/') ? '_blank' : undefined} rel="noopener noreferrer" {...props}>{children}</a>
-      ),
+      a: ({ href, children, ...props }: any) => {
+        const url = href || ''
+        const isFile = url.startsWith('/api/files/')
+        const isImage = /\.(png|jpe?g|gif|webp|svg|bmp)(\?|$)/i.test(url)
+        if (isFile && isImage) {
+          const tokenized = addToken(url)
+          return (
+            <a href={tokenized} target="_blank" rel="noopener noreferrer" className="block my-2 not-prose">
+              <img
+                src={tokenized}
+                alt={typeof children === 'string' ? children : 'image'}
+                className="max-h-96 max-w-full rounded-md border border-border bg-muted/30 object-contain cursor-zoom-in"
+              />
+            </a>
+          )
+        }
+        return (
+          <a href={addToken(url)} target={isFile ? '_blank' : undefined} rel="noopener noreferrer" {...props}>{children}</a>
+        )
+      },
       img: ({ src, ...props }: any) => (
-        <img src={addToken(src || '')} {...props} />
+        <img src={addToken(src || '')} className="max-h-96 max-w-full rounded-md border border-border my-2" {...props} />
       ),
     }
   }, [])
@@ -1118,6 +1156,8 @@ export function ChatPage() {
                 if (isUser) {
                   if (!text) return null
                   const attachmentMeta = msg.metadata?.attachments as Array<{filename: string; media_type: string; file_id: string}> | undefined
+                  const quoteMeta = msg.metadata?.quote as { author: string; text: string } | undefined
+                  const displayText = text
                   const isEditing = editingMsgId === msg.id
 
                   function submitEdit() {
@@ -1175,9 +1215,23 @@ export function ChatPage() {
                             </div>
                           </div>
                         ) : (
-                          <div className="rounded-2xl rounded-tr-sm bg-gradient-to-br from-primary to-primary/80 px-3.5 py-2 text-[14px] leading-relaxed text-primary-foreground shadow-sm">
-                            <div className="whitespace-pre-wrap break-words">{text}</div>
-                            {attachmentMeta && attachmentMeta.length > 0 && (
+                          <>
+                            {quoteMeta && (
+                              <div className="mb-1 max-w-full rounded-lg border-l-2 border-primary/60 bg-muted/40 px-2.5 py-1.5">
+                                <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-medium">
+                                  <svg width="9" height="9" viewBox="0 0 14 14" fill="none">
+                                    <path d="M2 11V8a3 3 0 013-3M2 11h2.5M2 11v.5a.5.5 0 00.5.5h2M8 11V8a3 3 0 013-3M8 11h2.5M8 11v.5a.5.5 0 00.5.5h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                                  </svg>
+                                  Replying to {quoteMeta.author}
+                                </div>
+                                <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground/90 break-words">
+                                  {quoteMeta.text.length > 200 ? quoteMeta.text.slice(0, 200) + '…' : quoteMeta.text}
+                                </div>
+                              </div>
+                            )}
+                            <div className="rounded-2xl rounded-tr-sm bg-gradient-to-br from-primary to-primary/80 px-3.5 py-2 text-[14px] leading-relaxed text-primary-foreground shadow-sm">
+                              <div className="whitespace-pre-wrap break-words">{displayText}</div>
+                              {attachmentMeta && attachmentMeta.length > 0 && (
                               <div className="mt-2 flex flex-wrap gap-1.5">
                                 {attachmentMeta.map(a => (
                                   <span key={a.file_id} className="inline-flex items-center gap-1 rounded-full bg-white/15 px-2 py-0.5 text-[11px]">
@@ -1188,6 +1242,7 @@ export function ChatPage() {
                               </div>
                             )}
                           </div>
+                          </>
                         )}
                       </div>
                       {/* Hover actions — hidden while editing */}
@@ -1229,6 +1284,16 @@ export function ChatPage() {
                               <path d="M12 2L2 7l4 2 1 4 5-11z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
                             </svg>
                             Resend
+                          </button>
+                          <button
+                            onClick={() => quoteMessage(text, 'You')}
+                            className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted transition-colors"
+                            title="Quote in reply"
+                          >
+                            <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
+                              <path d="M2 11V8a3 3 0 013-3M2 11h2.5M2 11v.5a.5.5 0 00.5.5h2M8 11V8a3 3 0 013-3M8 11h2.5M8 11v.5a.5.5 0 00.5.5h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                            </svg>
+                            Quote
                           </button>
                         </div>
                       )}
@@ -1293,6 +1358,16 @@ export function ChatPage() {
                               <path d="M10 4V3a1.5 1.5 0 00-1.5-1.5H3A1.5 1.5 0 001.5 3v5.5A1.5 1.5 0 003 10h1" stroke="currentColor" strokeWidth="1.3"/>
                             </svg>
                           )}
+                        </button>
+                        {/* Quote */}
+                        <button
+                          onClick={() => quoteMessage(text, selectedAgent?.name || 'Assistant')}
+                          className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted transition-colors"
+                          title="Quote in reply"
+                        >
+                          <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+                            <path d="M2 11V8a3 3 0 013-3M2 11h2.5M2 11v.5a.5.5 0 00.5.5h2M8 11V8a3 3 0 013-3M8 11h2.5M8 11v.5a.5.5 0 00.5.5h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                          </svg>
                         </button>
                         {/* Thumbs up */}
                         <button
@@ -1432,6 +1507,30 @@ export function ChatPage() {
                 </div>
               )}
               <div className="rounded-2xl border border-border bg-card/80 backdrop-blur-xl transition-colors focus-within:border-primary/50">
+                {/* Quote preview */}
+                {quotedRef && (
+                  <div className="flex items-start gap-2 px-3 pt-2.5 pb-1">
+                    <div className="flex-1 min-w-0 rounded-lg border-l-2 border-primary/60 bg-muted/40 px-2.5 py-1.5">
+                      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-medium">
+                        <svg width="9" height="9" viewBox="0 0 14 14" fill="none">
+                          <path d="M2 11V8a3 3 0 013-3M2 11h2.5M2 11v.5a.5.5 0 00.5.5h2M8 11V8a3 3 0 013-3M8 11h2.5M8 11v.5a.5.5 0 00.5.5h2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                        </svg>
+                        Replying to {quotedRef.author}
+                      </div>
+                      <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground/90 break-words">
+                        {quotedRef.text.length > 200 ? quotedRef.text.slice(0, 200) + '…' : quotedRef.text}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setQuotedRef(null)}
+                      className="shrink-0 rounded-md p-1 text-muted-foreground/50 hover:text-foreground hover:bg-muted transition-colors"
+                      title="Remove quote"
+                    >
+                      <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                    </button>
+                  </div>
+                )}
                 {/* Attachment previews */}
                 {attachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 px-3 pt-2.5 pb-1">
@@ -1473,7 +1572,10 @@ export function ChatPage() {
                     ref={textareaRef}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!streaming) sendMessage() } }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!streaming) sendMessage() }
+                      else if (e.key === 'Escape' && quotedRef && !input) { e.preventDefault(); setQuotedRef(null) }
+                    }}
                     onPaste={(e) => { const items = [...e.clipboardData.items]; const img = items.find(i => i.type.startsWith('image/')); if (img) { e.preventDefault(); const file = img.getAsFile(); if (file) handleFileSelect(file) } }}
                     placeholder={!selectedAgent ? 'Select an agent…' : connected ? (streaming ? 'Generating…' : 'Message…') : 'Connecting…'}
                     disabled={!connected || !selectedAgent}

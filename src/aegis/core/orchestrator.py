@@ -84,6 +84,7 @@ class AgentOrchestrator:
         content: str,
         config: AgentConfig | None = None,
         attachments: list[dict[str, str]] | None = None,
+        quote: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Send a message and stream the response."""
         sess = self.get_session(session_id)
@@ -100,6 +101,7 @@ class AgentOrchestrator:
                 user_message=content,
                 config=effective_config,
                 attachments=attachments or [],
+                quote=quote,
             ):
                 yield event
         except Exception as e:

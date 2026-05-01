@@ -144,6 +144,7 @@ export function SchedulesPage() {
     try {
       const { schedule } = await createSchedule(selectedAgentId, {
         name: name.trim(), cron_expr: cronExpr.trim(), prompt: prompt.trim(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
       })
       setSchedules(prev => [{ ...schedule, _agentName: agentName }, ...prev])
       setName(''); setPrompt(''); setCronExpr('0 9 * * *'); setShowCreate(false)
@@ -180,6 +181,7 @@ export function SchedulesPage() {
     try {
       const { schedule } = await updateSchedule(sched.agent_id, editingId, {
         name: editName.trim(), cron_expr: editCron.trim(), prompt: editPrompt.trim(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
       })
       setSchedules(prev => prev.map(s => s.id === editingId ? { ...schedule, _agentName: sched._agentName } : s))
       setEditingId(null)

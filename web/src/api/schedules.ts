@@ -57,6 +57,7 @@ export async function updateSchedule(agentId: string, taskId: string, data: {
   cron_expr?: string
   prompt?: string
   is_active?: boolean
+  timezone?: string
 }): Promise<{ schedule: Schedule }> {
   return fetchApi(`/api/agents/${agentId}/schedules/${taskId}`, {
     method: 'PATCH',
